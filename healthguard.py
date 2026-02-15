@@ -1,9 +1,10 @@
 import sqlite3
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 from typing import List, Optional
 
-import pandas as pd
 
 VITAL_RANGES = {
     "heart_rate": (60, 100),
@@ -113,6 +114,185 @@ class HealthPipeline:
             "time_range": [float(df["timestamp"].min()), float(df["timestamp"].max())],
             "vitals_stats": stats,
         }
+
+    def close(self):
+        self.conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Persistence Layer
+# ---------------------------------------------------------------------------
+
+
+class PatientRepository:
+    """SQLite-backed CRUD repository for patient profiles."""
+
+    def __init__(self, db_path: str = ":memory:"):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def _init_schema(self):
+        with self.conn:
+            self.conn.execute(
+                "CREATE TABLE IF NOT EXISTS patients ("
+                "patient_id TEXT PRIMARY KEY, "
+                "name TEXT NOT NULL, "
+                "age INTEGER NOT NULL, "
+                "medical_history TEXT DEFAULT '', "
+                "created_at REAL NOT NULL)"
+            )
+
+    @contextmanager
+    def _cursor(self):
+        """Context manager providing a cursor with automatic commit/rollback."""
+        cur = self.conn.cursor()
+        try:
+            yield cur
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+    def create_patient(self, name: str, age: int, medical_history: str = "") -> str:
+        """Insert a new patient and return the generated patient_id."""
+        patient_id = f"P-{uuid.uuid4().hex[:8]}"
+        with self._cursor() as cur:
+            cur.execute(
+                "INSERT INTO patients (patient_id, name, age, medical_history, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (patient_id, name, age, medical_history, time.time()),
+            )
+        return patient_id
+
+    def get_patient(self, patient_id: str) -> Optional[dict]:
+        """Return a patient dict or None if not found."""
+        with self._cursor() as cur:
+            cur.execute("SELECT * FROM patients WHERE patient_id = ?", (patient_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+    def list_patients(self, limit: int = 20, offset: int = 0) -> List[dict]:
+        """Paginated listing of patients ordered by creation time descending."""
+        with self._cursor() as cur:
+            cur.execute(
+                "SELECT * FROM patients ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def delete_patient(self, patient_id: str) -> bool:
+        """Delete a patient. Returns True if a row was actually removed."""
+        with self._cursor() as cur:
+            cur.execute("DELETE FROM patients WHERE patient_id = ?", (patient_id,))
+            return cur.rowcount > 0
+
+    def close(self):
+        self.conn.close()
+
+
+class HealthRecordRepository:
+    """SQLite-backed repository for health-metric time-series data."""
+
+    TABLE = "health_records"
+
+    def __init__(self, db_path: str = ":memory:"):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path)
+        # Performance pragmas for bulk writes
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA cache_size=-64000")
+        self._init_schema()
+
+    def _init_schema(self):
+        with self.conn:
+            self.conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {self.TABLE} ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "patient_id TEXT NOT NULL, "
+                "timestamp REAL NOT NULL, "
+                "heart_rate REAL, "
+                "bp_systolic REAL, "
+                "bp_diastolic REAL, "
+                "temperature REAL, "
+                "spo2 REAL, "
+                "resp_rate REAL)"
+            )
+            self.conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_hr_pid_ts "
+                f"ON {self.TABLE}(patient_id, timestamp)"
+            )
+
+    @contextmanager
+    def _cursor(self):
+        """Context manager providing a cursor with automatic commit/rollback."""
+        cur = self.conn.cursor()
+        try:
+            yield cur
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+
+    # -- write operations ------------------------------------------------
+
+    def insert_record(
+        self, patient_id: str, metrics: dict, timestamp: Optional[float] = None
+    ):
+        """Insert a single health-metric record."""
+        if timestamp is None:
+            timestamp = time.time()
+        cols = ["patient_id", "timestamp"] + list(metrics.keys())
+        vals = [patient_id, timestamp] + list(metrics.values())
+        placeholders = ", ".join(["?"] * len(cols))
+        col_str = ", ".join(cols)
+        with self._cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {self.TABLE} ({col_str}) VALUES ({placeholders})", vals
+            )
+
+    def bulk_insert(self, patient_id: str, df: pd.DataFrame):
+        """Bulk-insert a DataFrame of health metrics for a given patient.
+
+        Uses pandas ``to_sql`` for high throughput (>= 10 k rows/sec).
+        """
+        df = df.copy()
+        df["patient_id"] = patient_id
+        if "timestamp" not in df.columns:
+            df["timestamp"] = time.time()
+        with self._cursor() as _cur:
+            df.to_sql(self.TABLE, self.conn, if_exists="append", index=False)
+
+    # -- read operations -------------------------------------------------
+
+    def query_records(
+        self, patient_id: str, start_time: float, end_time: float
+    ) -> pd.DataFrame:
+        """Return records for *patient_id* whose timestamp is in [start, end]."""
+        with self._cursor() as _cur:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self.TABLE} "
+                "WHERE patient_id = ? AND timestamp >= ? AND timestamp <= ? "
+                "ORDER BY timestamp ASC",
+                self.conn,
+                params=(patient_id, start_time, end_time),
+            )
+
+    def get_latest(self, patient_id: str, n: int = 10) -> pd.DataFrame:
+        """Return the *n* most recent records for a patient (newest first)."""
+        with self._cursor() as _cur:
+            return pd.read_sql_query(
+                f"SELECT * FROM {self.TABLE} "
+                "WHERE patient_id = ? ORDER BY timestamp DESC LIMIT ?",
+                self.conn,
+                params=(patient_id, n),
+            )
 
     def close(self):
         self.conn.close()
